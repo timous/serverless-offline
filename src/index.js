@@ -3,7 +3,7 @@
 // One-line coffee-script support
 require('coffee-script/register');
 
-// Node dependencies 
+// Node dependencies
 const fs = require('fs');
 const path = require('path');
 
@@ -25,11 +25,38 @@ const toPlainOrEmptyObject = require('./utils').toPlainOrEmptyObject;
 
 const printBlankLine = () => console.log();
 
+const DEFAULT_JSON_REQUEST_TEMPLATE = `
+            #define( $loop )
+              {
+              #foreach($key in $map.keySet())
+                  "$util.escapeJavaScript($key)":
+                    "$util.escapeJavaScript($map.get($key))"
+                    #if( $foreach.hasNext ) , #end
+              #end
+              }
+            #end
+            {
+              "body": $input.json("$"),
+              "method": "$context.httpMethod",
+              "principalId": "$context.authorizer.principalId",
+              #set( $map = $input.params().header )
+              "headers": $loop,
+              #set( $map = $input.params().querystring )
+              "query": $loop,
+              #set( $map = $input.params().path )
+              "path": $loop,
+              #set( $map = $context.identity )
+              "identity": $loop,
+              #set( $map = $stageVariables )
+              "stageVariables": $loop
+            }
+          `;
+
 /*
   I'm against monolithic code like this file, but splitting it induces unneeded complexity.
 */
 class Offline {
-  
+
   constructor(serverless, options) {
     this.serverless = serverless;
     this.service = serverless.service;
@@ -84,7 +111,7 @@ class Offline {
         }
       }
     };
-    
+
     this.hooks = {
       'offline:start': this.start.bind(this)
     };
@@ -107,7 +134,7 @@ class Offline {
     process.env.IS_OFFLINE = true; // Some users would like to know their environment outside of the handler
     this.requests = {};            // Maps a request id to the request's state (done: bool, timeout: timer)
     this.envVars = {};             // Env vars are specific to each service
-    
+
     // Methods
     this._mergeEnvVars();   // Env vars are specific to each service
     this._setOptions();     // Will create meaningful options from cli options
@@ -117,12 +144,12 @@ class Offline {
     this._create404Route(); // Not found handling
     this._listen();         // Hapijs listen
   }
-  
+
   _mergeEnvVars() {
     const env = this.service.environment;
     const stage = env.stages[this.options.stage];
     const region = stage.regions[this.options.region];
-    
+
     Object.keys(env.vars).forEach(key => {
       this.envVars[key] = env.vars[key];
     });
@@ -133,9 +160,9 @@ class Offline {
       this.envVars[key] = region.vars[key];
     });
   }
-  
+
   _setOptions() {
-    
+
     // Applies defaults
     this.options = {
       port:                  this.options.port || 3000,
@@ -155,12 +182,12 @@ class Offline {
     if (!this.options.prefix.endsWith('/')) this.options.prefix += '/';
 
     this.globalBabelOptions = ((this.service.custom || {})['serverless-offline'] || {}).babelOptions;
-    
+
     this.velocityContextOptions = {
       stageVariables: this.service.environment.stages[this.options.stage].vars,
       stage: this.options.stage,
     };
-    
+
     // Parse CORS options
     this.options.corsAllowOrigin = this.options.corsAllowOrigin.replace(/\s/g, '').split(',');
     this.options.corsAllowHeaders = this.options.corsAllowHeaders.replace(/\s/g, '').split(',');
@@ -172,7 +199,7 @@ class Offline {
       headers: this.options.corsAllowHeaders,
       credentials: this.options.corsAllowCredentials,
     };
-    
+
     this.serverlessLog(`Starting Offline: ${this.options.stage}/${this.options.region}.`);
     debugLog('options:', this.options);
     debugLog('globalBabelOptions:', this.globalBabelOptions);
@@ -223,7 +250,7 @@ class Offline {
 
   _createRoutes() {
     const defaultContentType = 'application/json';
-    
+
     // No python or java support yet :'(
     const serviceRuntime = this.service.provider.runtime;
     if (['nodejs', 'nodejs4.3', 'babel'].indexOf(serviceRuntime) === -1) {
@@ -233,7 +260,7 @@ class Offline {
     }
 
     Object.keys(this.service.functions).forEach(key => {
-      
+
       const fun = this.service.getFunction(key);
       const funName = key;
       const funOptions = functionHelper.getFunctionOptions(fun, key, this.serverless.config.servicePath);
@@ -244,11 +271,14 @@ class Offline {
 
       // Adds a route for each http endpoint
       fun.events.forEach(event => {
-        
-        if (!event.http) return;
-        
-        const endpoint = event.http;
 
+        if (!event.http) return;
+
+        let endpoint = event.http;
+        if(typeof endpoint==='string'){
+          const parts = endpoint.split(' ',2)
+          endpoint = {path: parts[1], method: parts[0]}
+        }
         let firstCall = true;
 
         const epath = endpoint.path;
@@ -273,16 +303,16 @@ class Offline {
             }
             authFunctionName = endpoint.authorizer.name;
           }
-          
+
           this.serverlessLog(`Configuring Authorization: ${endpoint.path} ${authFunctionName}`);
-          
+
           let authFunction = this.service.getFunction(authFunctionName);
-          
+
           if (!authFunction) {
             this.serverlessLog(`Authorization function ${authFunctionName} does not exist`);
             this._logAndExit();
           }
-          
+
           let authorizerOptions = {};
           if (typeof endpoint.authorizer === 'string') {
             // serverless 1.x will create default values, so we will to
@@ -294,15 +324,15 @@ class Offline {
           else {
             authorizerOptions = endpoint.authorizer;
           }
-          
+
           // Create a unique scheme per endpoint
           // This allows the methodArn on the event property to be set appropriately
           const authKey = `${funName}-${authFunctionName}-${method}-${epath}`;
           const authSchemeName = `scheme-${authKey}`;
           authStrategyName = `strategy-${authKey}`; // set strategy name for the route config
-          
+
           debugLog(`Creating Authorization scheme for ${authKey}`);
-          
+
           // Create the Auth Scheme for the endpoint
           const scheme = createAuthScheme(
             authFunction,
@@ -313,7 +343,7 @@ class Offline {
             this.serverlessLog,
             this.serverless.config.servicePath
           );
-          
+
           // Set the auth scheme and strategy on the server
           this.server.auth.scheme(authSchemeName, scheme);
           this.server.auth.strategy(authStrategyName, authSchemeName);
@@ -343,17 +373,17 @@ class Offline {
             // Holds the response to do async op
             const response = reply.response().hold();
             const contentType = request.mime || defaultContentType;
-            const requestTemplate = requestTemplates[contentType];
+            const requestTemplate = requestTemplates && requestTemplates[contentType]||DEFAULT_JSON_REQUEST_TEMPLATE;
 
             debugLog('requestId:', requestId);
             debugLog('contentType:', contentType);
             debugLog('requestTemplate:', requestTemplate);
             debugLog('payload:', request.payload);
-            
+
             /* HANDLER LAZY LOADING */
-            
+
             let handler; // The lambda function
-            
+
             try {
               handler = functionHelper.createHandler(funOptions, this.options);
             } catch (err) {
@@ -379,7 +409,7 @@ class Offline {
 
             event.isOffline = true;
             debugLog('event:', event);
-            
+
             // We create the context, its callback (context.done/succeed/fail) will send the HTTP response
             const lambdaContext = createLambdaContext(fun, (err, data) => {
               // Everything in this block happens once the lambda function has resolved
@@ -431,11 +461,11 @@ class Offline {
 
               debugLog(`Using response '${responseName}'`);
 
-              const chosenResponse = endpoint.responses[responseName];
+              const chosenResponse = endpoint.responses && endpoint.responses[responseName];
 
               /* RESPONSE PARAMETERS PROCCESSING */
 
-              const responseParameters = chosenResponse.responseParameters;
+              const responseParameters = chosenResponse && chosenResponse.responseParameters;
 
               if (isPlainObject(responseParameters)) {
 
@@ -493,7 +523,7 @@ class Offline {
               /* RESPONSE TEMPLATE PROCCESSING */
 
               // If there is a responseTemplate, we apply it to the result
-              const responseTemplates = chosenResponse.responseTemplates;
+              const responseTemplates = chosenResponse && chosenResponse.responseTemplates;
 
               if (isPlainObject(responseTemplates)) {
 
@@ -526,8 +556,8 @@ class Offline {
 
               /* HAPIJS RESPONSE CONFIGURATION */
 
-              const statusCode = chosenResponse.statusCode || 200;
-              if (!chosenResponse.statusCode) {
+              const statusCode = chosenResponse && chosenResponse.statusCode || 200;
+              if (!chosenResponse || !chosenResponse.statusCode) {
                 printBlankLine();
                 this.serverlessLog(`Warning: No statusCode found for response "${responseName}".`);
               }
@@ -563,7 +593,7 @@ class Offline {
               this._replyTimeout.bind(this, response, funName, funOptions.funTimeout, requestId),
               funOptions.funTimeout
             );
-            
+
             // Finally we call the handler
             debugLog('_____ CALLING HANDLER _____');
             try {
